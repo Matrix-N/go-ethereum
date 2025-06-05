@@ -45,7 +45,7 @@ func (b *Blob) UnmarshalJSON(input []byte) error {
 }
 
 // MarshalText returns the hex representation of b.
-func (b Blob) MarshalText() ([]byte, error) {
+func (b *Blob) MarshalText() ([]byte, error) {
 	return hexutil.Bytes(b[:]).MarshalText()
 }
 
@@ -147,6 +147,17 @@ func VerifyBlobProof(blob *Blob, commitment Commitment, proof Proof) error {
 		return ckzgVerifyBlobProof(blob, commitment, proof)
 	}
 	return gokzgVerifyBlobProof(blob, commitment, proof)
+}
+
+// ComputeCellProofs returns the KZG cell proofs that are used to verify the blob against
+// the commitment.
+//
+// This method does not verify that the commitment is correct with respect to blob.
+func ComputeCellProofs(blob *Blob) ([]Proof, error) {
+	if useCKZG.Load() {
+		return ckzgComputeCellProofs(blob)
+	}
+	return gokzgComputeCellProofs(blob)
 }
 
 // CalcBlobHashV1 calculates the 'versioned blob hash' of a commitment.
