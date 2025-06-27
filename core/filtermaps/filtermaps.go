@@ -50,10 +50,9 @@ var (
 )
 
 const (
-	databaseVersion       = 1    // reindexed if database version does not match
+	databaseVersion       = 2    // reindexed if database version does not match
 	cachedLastBlocks      = 1000 // last block of map pointers
 	cachedLvPointers      = 1000 // first log value pointer of block pointers
-	cachedBaseRows        = 100  // groups of base layer filter row data
 	cachedFilterMaps      = 3    // complete filter maps (cached by map renderer)
 	cachedRenderSnapshots = 8    // saved map renderer data at block boundaries
 )
@@ -85,17 +84,22 @@ type FilterMaps struct {
 	// fields written by the indexer and read by matcher backend. Indexer can
 	// read them without a lock and write them under indexLock write lock.
 	// Matcher backend can read them under indexLock read lock.
-	indexLock           sync.RWMutex
-	indexedRange        filterMapsRange
-	cleanedEpochsBefore uint32     // all unindexed data cleaned before this point
-	indexedView         *ChainView // always consistent with the log index
-	hasTempRange        bool
+	indexLock    sync.RWMutex
+	indexedRange filterMapsRange
+	indexedView  *ChainView // always consistent with the log index
+	hasTempRange bool
+
+	// cleanedEpochsBefore indicates that all unindexed data before this point
+	// has been cleaned.
+	//
+	// This field is only accessed and modified within tryUnindexTail, so no
+	// explicit locking is required.
+	cleanedEpochsBefore uint32
 
 	// also accessed by indexer and matcher backend but no locking needed.
 	filterMapCache *lru.Cache[uint32, filterMap]
 	lastBlockCache *lru.Cache[uint32, lastBlockOfMap]
 	lvPointerCache *lru.Cache[uint64, uint64]
-	baseRowsCache  *lru.Cache[uint64, [][]uint32]
 
 	// the matchers set and the fields of FilterMapsMatcherBackend instances are
 	// read and written both by exported functions and the indexer.
@@ -221,7 +225,7 @@ type Config struct {
 // NewFilterMaps creates a new FilterMaps and starts the indexer.
 func NewFilterMaps(db ethdb.KeyValueStore, initView *ChainView, historyCutoff, finalBlock uint64, params Params, config Config) *FilterMaps {
 	rs, initialized, err := rawdb.ReadFilterMapsRange(db)
-	if err != nil || rs.Version != databaseVersion {
+	if err != nil || (initialized && rs.Version != databaseVersion) {
 		rs, initialized = rawdb.FilterMapsRange{}, false
 		log.Warn("Invalid log index database version; resetting log index")
 	}
@@ -238,6 +242,8 @@ func NewFilterMaps(db ethdb.KeyValueStore, initView *ChainView, historyCutoff, f
 		disabledCh:        make(chan struct{}),
 		exportFileName:    config.ExportFileName,
 		Params:            params,
+		targetView:        initView,
+		indexedView:       initView,
 		indexedRange: filterMapsRange{
 			initialized:      initialized,
 			headIndexed:      rs.HeadIndexed,
@@ -248,26 +254,18 @@ func NewFilterMaps(db ethdb.KeyValueStore, initView *ChainView, historyCutoff, f
 		},
 		// deleting last unindexed epoch might have been interrupted by shutdown
 		cleanedEpochsBefore: max(rs.MapsFirst>>params.logMapsPerEpoch, 1) - 1,
-		historyCutoff:       historyCutoff,
-		finalBlock:          finalBlock,
-		matcherSyncCh:       make(chan *FilterMapsMatcherBackend),
-		matchers:            make(map[*FilterMapsMatcherBackend]struct{}),
-		filterMapCache:      lru.NewCache[uint32, filterMap](cachedFilterMaps),
-		lastBlockCache:      lru.NewCache[uint32, lastBlockOfMap](cachedLastBlocks),
-		lvPointerCache:      lru.NewCache[uint64, uint64](cachedLvPointers),
-		baseRowsCache:       lru.NewCache[uint64, [][]uint32](cachedBaseRows),
-		renderSnapshots:     lru.NewCache[uint64, *renderedMap](cachedRenderSnapshots),
-	}
 
-	// Set initial indexer target.
-	f.targetView = initView
-	if f.indexedRange.initialized {
-		f.indexedView = f.initChainView(f.targetView)
-		f.indexedRange.headIndexed = f.indexedRange.blocks.AfterLast() == f.indexedView.HeadNumber()+1
-		if !f.indexedRange.headIndexed {
-			f.indexedRange.headDelimiter = 0
-		}
+		historyCutoff:   historyCutoff,
+		finalBlock:      finalBlock,
+		matcherSyncCh:   make(chan *FilterMapsMatcherBackend),
+		matchers:        make(map[*FilterMapsMatcherBackend]struct{}),
+		filterMapCache:  lru.NewCache[uint32, filterMap](cachedFilterMaps),
+		lastBlockCache:  lru.NewCache[uint32, lastBlockOfMap](cachedLastBlocks),
+		lvPointerCache:  lru.NewCache[uint64, uint64](cachedLvPointers),
+		renderSnapshots: lru.NewCache[uint64, *renderedMap](cachedRenderSnapshots),
 	}
+	f.checkRevertRange() // revert maps that are inconsistent with the current chain view
+
 	if f.indexedRange.hasIndexedBlocks() {
 		log.Info("Initialized log indexer",
 			"first block", f.indexedRange.blocks.First(), "last block", f.indexedRange.blocks.Last(),
@@ -296,29 +294,40 @@ func (f *FilterMaps) Stop() {
 	f.closeWg.Wait()
 }
 
-// initChainView returns a chain view consistent with both the current target
-// view and the current state of the log index as found in the database, based
-// on the last block of stored maps.
-// Note that the returned view might be shorter than the existing index if
-// the latest maps are not consistent with targetView.
-func (f *FilterMaps) initChainView(chainView *ChainView) *ChainView {
-	mapIndex := f.indexedRange.maps.AfterLast()
-	for {
-		var ok bool
-		mapIndex, ok = f.lastMapBoundaryBefore(mapIndex)
-		if !ok {
-			break
-		}
-		lastBlockNumber, lastBlockId, err := f.getLastBlockOfMap(mapIndex)
-		if err != nil {
-			log.Error("Could not initialize indexed chain view", "error", err)
-			break
-		}
-		if lastBlockNumber <= chainView.HeadNumber() && chainView.BlockId(lastBlockNumber) == lastBlockId {
-			return chainView.limitedView(lastBlockNumber)
-		}
+// checkRevertRange checks whether the existing index is consistent with the
+// current indexed view and reverts inconsistent maps if necessary.
+func (f *FilterMaps) checkRevertRange() {
+	if f.indexedRange.maps.Count() == 0 {
+		return
 	}
-	return chainView.limitedView(0)
+	lastMap := f.indexedRange.maps.Last()
+	lastBlockNumber, lastBlockId, err := f.getLastBlockOfMap(lastMap)
+	if err != nil {
+		log.Error("Error initializing log index database; resetting log index", "error", err)
+		f.reset()
+		return
+	}
+	for lastBlockNumber > f.indexedView.HeadNumber() || f.indexedView.BlockId(lastBlockNumber) != lastBlockId {
+		// revert last map
+		if f.indexedRange.maps.Count() == 1 {
+			f.reset() // reset database if no rendered maps remained
+			return
+		}
+		lastMap--
+		newRange := f.indexedRange
+		newRange.maps.SetLast(lastMap)
+		lastBlockNumber, lastBlockId, err = f.getLastBlockOfMap(lastMap)
+		if err != nil {
+			log.Error("Error initializing log index database; resetting log index", "error", err)
+			f.reset()
+			return
+		}
+		newRange.blocks.SetAfterLast(lastBlockNumber) // lastBlockNumber is probably partially indexed
+		newRange.headIndexed = false
+		newRange.headDelimiter = 0
+		// only shorten range and leave map data; next head render will overwrite it
+		f.setRange(f.db, f.indexedView, newRange, false)
+	}
 }
 
 // reset un-initializes the FilterMaps structure and removes all related data from
@@ -336,7 +345,6 @@ func (f *FilterMaps) reset() {
 	f.renderSnapshots.Purge()
 	f.lastBlockCache.Purge()
 	f.lvPointerCache.Purge()
-	f.baseRowsCache.Purge()
 	f.indexLock.Unlock()
 	// deleting the range first ensures that resetDb will be called again at next
 	// startup and any leftover data will be removed even if it cannot finish now.
@@ -444,6 +452,7 @@ func (f *FilterMaps) safeDeleteWithLogs(deleteFn func(db ethdb.KeyValueStore, ha
 
 // setRange updates the indexed chain view and covered range and also adds the
 // changes to the given batch.
+//
 // Note that this function assumes that the index write lock is being held.
 func (f *FilterMaps) setRange(batch ethdb.KeyValueWriter, newView *ChainView, newRange filterMapsRange, isTempRange bool) {
 	f.indexedView = newView
@@ -477,6 +486,7 @@ func (f *FilterMaps) setRange(batch ethdb.KeyValueWriter, newView *ChainView, ne
 // Note that this function assumes that the log index structure is consistent
 // with the canonical chain at the point where the given log value index points.
 // If this is not the case then an invalid result or an error may be returned.
+//
 // Note that this function assumes that the indexer read lock is being held when
 // called from outside the indexerLoop goroutine.
 func (f *FilterMaps) getLogByLvIndex(lvIndex uint64) (*types.Log, error) {
@@ -551,47 +561,69 @@ func (f *FilterMaps) getFilterMap(mapIndex uint32) (filterMap, error) {
 	}
 	fm := make(filterMap, f.mapHeight)
 	for rowIndex := range fm {
-		var err error
-		fm[rowIndex], err = f.getFilterMapRow(mapIndex, uint32(rowIndex), false)
+		rows, err := f.getFilterMapRows([]uint32{mapIndex}, uint32(rowIndex), false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load filter map %d from database: %v", mapIndex, err)
 		}
+		fm[rowIndex] = rows[0]
 	}
 	f.filterMapCache.Add(mapIndex, fm)
 	return fm, nil
 }
 
-// getFilterMapRow fetches the given filter map row. If baseLayerOnly is true
-// then only the first baseRowLength entries are returned.
-func (f *FilterMaps) getFilterMapRow(mapIndex, rowIndex uint32, baseLayerOnly bool) (FilterRow, error) {
-	baseMapRowIndex := f.mapRowIndex(mapIndex&-f.baseRowGroupLength, rowIndex)
-	baseRows, ok := f.baseRowsCache.Get(baseMapRowIndex)
-	if !ok {
-		var err error
-		baseRows, err = rawdb.ReadFilterMapBaseRows(f.db, baseMapRowIndex, f.baseRowGroupLength, f.logMapWidth)
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve filter map %d base rows %d: %v", mapIndex, rowIndex, err)
+// getFilterMapRows fetches a set of filter map rows at the corresponding map
+// indices and a shared row index. If baseLayerOnly is true then only the first
+// baseRowLength entries are returned.
+func (f *FilterMaps) getFilterMapRows(mapIndices []uint32, rowIndex uint32, baseLayerOnly bool) ([]FilterRow, error) {
+	rows := make([]FilterRow, len(mapIndices))
+	var ptr int
+	for len(mapIndices) > ptr {
+		baseRowGroup := mapIndices[ptr] / f.baseRowGroupLength
+		groupLength := 1
+		for ptr+groupLength < len(mapIndices) && mapIndices[ptr+groupLength]/f.baseRowGroupLength == baseRowGroup {
+			groupLength++
 		}
-		f.baseRowsCache.Add(baseMapRowIndex, baseRows)
+		if err := f.getFilterMapRowsOfGroup(rows[ptr:ptr+groupLength], mapIndices[ptr:ptr+groupLength], rowIndex, baseLayerOnly); err != nil {
+			return nil, err
+		}
+		ptr += groupLength
 	}
-	baseRow := slices.Clone(baseRows[mapIndex&(f.baseRowGroupLength-1)])
-	if baseLayerOnly {
-		return baseRow, nil
-	}
-	extRow, err := rawdb.ReadFilterMapExtRow(f.db, f.mapRowIndex(mapIndex, rowIndex), f.logMapWidth)
+	return rows, nil
+}
+
+// getFilterMapRowsOfGroup fetches a set of filter map rows at map indices
+// belonging to the same base row group.
+func (f *FilterMaps) getFilterMapRowsOfGroup(target []FilterRow, mapIndices []uint32, rowIndex uint32, baseLayerOnly bool) error {
+	baseRowGroup := mapIndices[0] / f.baseRowGroupLength
+	baseMapRowIndex := f.mapRowIndex(baseRowGroup*f.baseRowGroupLength, rowIndex)
+	baseRows, err := rawdb.ReadFilterMapBaseRows(f.db, baseMapRowIndex, f.baseRowGroupLength, f.logMapWidth)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve filter map %d extended row %d: %v", mapIndex, rowIndex, err)
+		return fmt.Errorf("failed to retrieve base row group %d of row %d: %v", baseRowGroup, rowIndex, err)
 	}
-	return FilterRow(append(baseRow, extRow...)), nil
+	for i, mapIndex := range mapIndices {
+		if mapIndex/f.baseRowGroupLength != baseRowGroup {
+			panic("mapIndices are not in the same base row group")
+		}
+		row := baseRows[mapIndex&(f.baseRowGroupLength-1)]
+		if !baseLayerOnly {
+			extRow, err := rawdb.ReadFilterMapExtRow(f.db, f.mapRowIndex(mapIndex, rowIndex), f.logMapWidth)
+			if err != nil {
+				return fmt.Errorf("failed to retrieve filter map %d extended row %d: %v", mapIndex, rowIndex, err)
+			}
+			row = append(row, extRow...)
+		}
+		target[i] = row
+	}
+	return nil
 }
 
 // storeFilterMapRows stores a set of filter map rows at the corresponding map
 // indices and a shared row index.
 func (f *FilterMaps) storeFilterMapRows(batch ethdb.Batch, mapIndices []uint32, rowIndex uint32, rows []FilterRow) error {
 	for len(mapIndices) > 0 {
-		baseMapIndex := mapIndices[0] & -f.baseRowGroupLength
+		baseRowGroup := mapIndices[0] / f.baseRowGroupLength
 		groupLength := 1
-		for groupLength < len(mapIndices) && mapIndices[groupLength]&-f.baseRowGroupLength == baseMapIndex {
+		for groupLength < len(mapIndices) && mapIndices[groupLength]/f.baseRowGroupLength == baseRowGroup {
 			groupLength++
 		}
 		if err := f.storeFilterMapRowsOfGroup(batch, mapIndices[:groupLength], rowIndex, rows[:groupLength]); err != nil {
@@ -605,26 +637,20 @@ func (f *FilterMaps) storeFilterMapRows(batch ethdb.Batch, mapIndices []uint32, 
 // storeFilterMapRowsOfGroup stores a set of filter map rows at map indices
 // belonging to the same base row group.
 func (f *FilterMaps) storeFilterMapRowsOfGroup(batch ethdb.Batch, mapIndices []uint32, rowIndex uint32, rows []FilterRow) error {
-	baseMapIndex := mapIndices[0] & -f.baseRowGroupLength
-	baseMapRowIndex := f.mapRowIndex(baseMapIndex, rowIndex)
+	baseRowGroup := mapIndices[0] / f.baseRowGroupLength
+	baseMapRowIndex := f.mapRowIndex(baseRowGroup*f.baseRowGroupLength, rowIndex)
 	var baseRows [][]uint32
 	if uint32(len(mapIndices)) != f.baseRowGroupLength { // skip base rows read if all rows are replaced
-		var ok bool
-		baseRows, ok = f.baseRowsCache.Get(baseMapRowIndex)
-		if ok {
-			baseRows = slices.Clone(baseRows)
-		} else {
-			var err error
-			baseRows, err = rawdb.ReadFilterMapBaseRows(f.db, baseMapRowIndex, f.baseRowGroupLength, f.logMapWidth)
-			if err != nil {
-				return fmt.Errorf("failed to retrieve filter map %d base rows %d for modification: %v", mapIndices[0]&-f.baseRowGroupLength, rowIndex, err)
-			}
+		var err error
+		baseRows, err = rawdb.ReadFilterMapBaseRows(f.db, baseMapRowIndex, f.baseRowGroupLength, f.logMapWidth)
+		if err != nil {
+			return fmt.Errorf("failed to retrieve base row group %d of row %d for modification: %v", baseRowGroup, rowIndex, err)
 		}
 	} else {
 		baseRows = make([][]uint32, f.baseRowGroupLength)
 	}
 	for i, mapIndex := range mapIndices {
-		if mapIndex&-f.baseRowGroupLength != baseMapIndex {
+		if mapIndex/f.baseRowGroupLength != baseRowGroup {
 			panic("mapIndices are not in the same base row group")
 		}
 		baseRow := []uint32(rows[i])
@@ -636,7 +662,6 @@ func (f *FilterMaps) storeFilterMapRowsOfGroup(batch ethdb.Batch, mapIndices []u
 		baseRows[mapIndex&(f.baseRowGroupLength-1)] = baseRow
 		rawdb.WriteFilterMapExtRow(batch, f.mapRowIndex(mapIndex, rowIndex), extRow, f.logMapWidth)
 	}
-	f.baseRowsCache.Add(baseMapRowIndex, baseRows)
 	rawdb.WriteFilterMapBaseRows(batch, baseMapRowIndex, baseRows, f.logMapWidth)
 	return nil
 }
@@ -653,14 +678,11 @@ func (f *FilterMaps) mapRowIndex(mapIndex, rowIndex uint32) uint64 {
 }
 
 // getBlockLvPointer returns the starting log value index where the log values
-// generated by the given block are located. If blockNumber is beyond the current
-// head then the first unoccupied log value index is returned.
+// generated by the given block are located.
+//
 // Note that this function assumes that the indexer read lock is being held when
 // called from outside the indexerLoop goroutine.
 func (f *FilterMaps) getBlockLvPointer(blockNumber uint64) (uint64, error) {
-	if blockNumber >= f.indexedRange.blocks.AfterLast() && f.indexedRange.headIndexed {
-		return f.indexedRange.headDelimiter + 1, nil
-	}
 	if lvPointer, ok := f.lvPointerCache.Get(blockNumber); ok {
 		return lvPointer, nil
 	}
@@ -762,7 +784,7 @@ func (f *FilterMaps) deleteTailEpoch(epoch uint32) (bool, error) {
 		return false, errors.New("invalid tail epoch number")
 	}
 	// remove index data
-	if err := f.safeDeleteWithLogs(func(db ethdb.KeyValueStore, hashScheme bool, stopCb func(bool) bool) error {
+	deleteFn := func(db ethdb.KeyValueStore, hashScheme bool, stopCb func(bool) bool) error {
 		first := f.mapRowIndex(firstMap, 0)
 		count := f.mapRowIndex(firstMap+f.mapsPerEpoch, 0) - first
 		if err := rawdb.DeleteFilterMapRows(f.db, common.NewRange(first, count), hashScheme, stopCb); err != nil {
@@ -786,10 +808,13 @@ func (f *FilterMaps) deleteTailEpoch(epoch uint32) (bool, error) {
 			f.lvPointerCache.Remove(blockNumber)
 		}
 		return nil
-	}, fmt.Sprintf("Deleting tail epoch #%d", epoch), func() bool {
+	}
+	action := fmt.Sprintf("Deleting tail epoch #%d", epoch)
+	stopFn := func() bool {
 		f.processEvents()
 		return f.stop || !f.targetHeadIndexed()
-	}); err == nil {
+	}
+	if err := f.safeDeleteWithLogs(deleteFn, action, stopFn); err == nil {
 		// everything removed; mark as cleaned and report success
 		if f.cleanedEpochsBefore == epoch {
 			f.cleanedEpochsBefore = epoch + 1
@@ -808,6 +833,9 @@ func (f *FilterMaps) deleteTailEpoch(epoch uint32) (bool, error) {
 }
 
 // exportCheckpoints exports epoch checkpoints in the format used by checkpoints.go.
+//
+// Note: acquiring the indexLock read lock is unnecessary here, as this function
+// is always called within the indexLoop.
 func (f *FilterMaps) exportCheckpoints() {
 	finalLvPtr, err := f.getBlockLvPointer(f.finalBlock + 1)
 	if err != nil {

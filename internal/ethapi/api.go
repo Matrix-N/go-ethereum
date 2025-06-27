@@ -144,8 +144,8 @@ func (api *EthereumAPI) BlobBaseFee(ctx context.Context) *hexutil.Big {
 // - highestBlock:  block number of the highest block header this node has received from peers
 // - pulledStates:  number of state entries processed until now
 // - knownStates:   number of known state entries that still need to be pulled
-func (api *EthereumAPI) Syncing() (interface{}, error) {
-	progress := api.b.SyncProgress()
+func (api *EthereumAPI) Syncing(ctx context.Context) (interface{}, error) {
+	progress := api.b.SyncProgress(ctx)
 
 	// Return not syncing if the synchronisation already completed
 	if progress.Done() {
@@ -170,6 +170,7 @@ func (api *EthereumAPI) Syncing() (interface{}, error) {
 		"healingBytecode":        hexutil.Uint64(progress.HealingBytecode),
 		"txIndexFinishedBlocks":  hexutil.Uint64(progress.TxIndexFinishedBlocks),
 		"txIndexRemainingBlocks": hexutil.Uint64(progress.TxIndexRemainingBlocks),
+		"stateIndexRemaining":    hexutil.Uint64(progress.StateIndexRemaining),
 	}, nil
 }
 
@@ -1333,16 +1334,18 @@ func (api *TransactionAPI) GetTransactionCount(ctx context.Context, address comm
 // GetTransactionByHash returns the transaction for the given hash
 func (api *TransactionAPI) GetTransactionByHash(ctx context.Context, hash common.Hash) (*RPCTransaction, error) {
 	// Try to return an already finalized transaction
-	found, tx, blockHash, blockNumber, index, err := api.b.GetTransaction(ctx, hash)
+	found, tx, blockHash, blockNumber, index := api.b.GetTransaction(hash)
 	if !found {
 		// No finalized transaction, try to retrieve it from the pool
 		if tx := api.b.GetPoolTransaction(hash); tx != nil {
 			return NewRPCPendingTransaction(tx, api.b.CurrentHeader(), api.b.ChainConfig()), nil
 		}
-		if err == nil {
-			return nil, nil
+		// If also not in the pool there is a chance the tx indexer is still in progress.
+		if !api.b.TxIndexDone() {
+			return nil, NewTxIndexingError()
 		}
-		return nil, NewTxIndexingError()
+		// If the transaction is not found in the pool and the indexer is done, return nil
+		return nil, nil
 	}
 	header, err := api.b.HeaderByHash(ctx, blockHash)
 	if err != nil {
@@ -1354,27 +1357,31 @@ func (api *TransactionAPI) GetTransactionByHash(ctx context.Context, hash common
 // GetRawTransactionByHash returns the bytes of the transaction for the given hash.
 func (api *TransactionAPI) GetRawTransactionByHash(ctx context.Context, hash common.Hash) (hexutil.Bytes, error) {
 	// Retrieve a finalized transaction, or a pooled otherwise
-	found, tx, _, _, _, err := api.b.GetTransaction(ctx, hash)
+	found, tx, _, _, _ := api.b.GetTransaction(hash)
 	if !found {
 		if tx = api.b.GetPoolTransaction(hash); tx != nil {
 			return tx.MarshalBinary()
 		}
-		if err == nil {
-			return nil, nil
+		// If also not in the pool there is a chance the tx indexer is still in progress.
+		if !api.b.TxIndexDone() {
+			return nil, NewTxIndexingError()
 		}
-		return nil, NewTxIndexingError()
+		// If the transaction is not found in the pool and the indexer is done, return nil
+		return nil, nil
 	}
 	return tx.MarshalBinary()
 }
 
 // GetTransactionReceipt returns the transaction receipt for the given transaction hash.
 func (api *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.Hash) (map[string]interface{}, error) {
-	found, tx, blockHash, blockNumber, index, err := api.b.GetTransaction(ctx, hash)
-	if err != nil {
-		return nil, NewTxIndexingError() // transaction is not fully indexed
-	}
+	found, tx, blockHash, blockNumber, index := api.b.GetTransaction(hash)
 	if !found {
-		return nil, nil // transaction is not existent or reachable
+		// Make sure indexer is done.
+		if !api.b.TxIndexDone() {
+			return nil, NewTxIndexingError()
+		}
+		// No such tx.
+		return nil, nil
 	}
 	header, err := api.b.HeaderByHash(ctx, blockHash)
 	if err != nil {
@@ -1774,15 +1781,17 @@ func (api *DebugAPI) GetRawReceipts(ctx context.Context, blockNrOrHash rpc.Block
 // GetRawTransaction returns the bytes of the transaction for the given hash.
 func (api *DebugAPI) GetRawTransaction(ctx context.Context, hash common.Hash) (hexutil.Bytes, error) {
 	// Retrieve a finalized transaction, or a pooled otherwise
-	found, tx, _, _, _, err := api.b.GetTransaction(ctx, hash)
+	found, tx, _, _, _ := api.b.GetTransaction(hash)
 	if !found {
 		if tx = api.b.GetPoolTransaction(hash); tx != nil {
 			return tx.MarshalBinary()
 		}
-		if err == nil {
-			return nil, nil
+		// If also not in the pool there is a chance the tx indexer is still in progress.
+		if !api.b.TxIndexDone() {
+			return nil, NewTxIndexingError()
 		}
-		return nil, NewTxIndexingError()
+		// Transaction is not found in the pool and the indexer is done.
+		return nil, nil
 	}
 	return tx.MarshalBinary()
 }
@@ -1823,8 +1832,16 @@ func (api *DebugAPI) ChaindbCompact() error {
 }
 
 // SetHead rewinds the head of the blockchain to a previous block.
-func (api *DebugAPI) SetHead(number hexutil.Uint64) {
+func (api *DebugAPI) SetHead(number hexutil.Uint64) error {
+	header := api.b.CurrentHeader()
+	if header == nil {
+		return errors.New("current header is not available")
+	}
+	if header.Number.Uint64() <= uint64(number) {
+		return errors.New("not allowed to rewind to a future block")
+	}
 	api.b.SetHead(uint64(number))
+	return nil
 }
 
 // NetAPI offers network related RPC methods
